@@ -6,6 +6,53 @@ import numpy as np
 import warnings
 import sys
 
+try:
+    import spams
+    SPAMS = True
+except Exception:
+    SPAMS = False
+
+
+LASSO = 'Lasso'
+LASSOLARS = 'LassoLars'
+LASSOSPAMS = 'spams'
+DEFAULT_OPTIMIZER = LASSOSPAMS if SPAMS else LASSO
+
+
+class SpamWrapperOptimizer(object):
+    def __init__(self, positive=False, lambda_=1., loss='square',
+                 regul='l1', warm_start=True, intercept=False, params=None,
+                 random_init=True, max_iter=100):
+        self.lambda_ = lambda_
+        self.coef_ = None
+        self.positive = positive
+        self.warm_start = warm_start
+        self.params = {} if params is None else params
+        self.random_init = random_init
+        self.intercept = intercept
+        self.loss = loss
+        self.regul = regul
+        self.max_iter = max_iter
+
+    def fit(self, x, y):
+        if self.coef_ is None or not self.warm_start:
+            self.initialize(x.shape)
+        self.coef_ = spams.fistaFlat(
+            np.asfortranarray(y, dtype=np.double),
+            np.asfortranarray(x, dtype=np.double),
+            np.asfortranarray(self.coef_.reshape((self.coef_.size, 1)),
+                              dtype=np.double),
+            max_it=self.max_iter, lambda1=self.lambda_, loss=self.loss,
+            regul=self.regul, intercept=self.intercept,
+            **self.params).flatten()
+        return self
+
+    def initialize(self, x_shape):
+        if self.random_init:
+            self.coef_ = np.random.normal(size=(x_shape[1]))
+        else:
+            self.coef_ = np.zeros((x_shape[1]), dtype=np.float)
+
 
 def MSE(y_te, y_pred):
     """
@@ -77,7 +124,7 @@ class MuMuLaDer(object):
     fit: Fit model.
     predict: Predict using the MMLD model
     get_params: Get parameters for this estimator.
-    get_beta: Computes beta based on theta, alpha and
+    get_beta_: Computes beta based on theta, alpha and
         the task descriptors matrix
 
     Notes
@@ -88,30 +135,24 @@ class MuMuLaDer(object):
 
     def __init__(
             self, descriptors, lambda_1=1, lambda_2=1, fit_intercept=False,
-            fit_task_intercept=False, loss_f=MSE,
-            max_iter=100, max_inner_iter=10, tol=0.0000001, warm_start=False,
-            random_init=True, alpha_params=None, theta_params=None):
+            fit_task_intercept=False, optimizer='spams', loss_f=MSE,
+            max_iter=100, max_inner_iter=10, tol=0.01, warm_start=False,
+            random_init=False, alpha_params=None, theta_params=None):
 
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.fit_intercept = fit_intercept
         self.fit_task_intercept = fit_task_intercept
+        self.optimizer = optimizer
         self.loss_f = loss_f
         self.max_iter = max_iter
+        self.max_inner_iter = max_inner_iter
         self.tol = tol
         self.warm_start = warm_start
         self.random_init = random_init
 
         self.theta_params = {} if theta_params is None else theta_params
-        self.theta_params['alpha'] = lambda_1
-        self.theta_params['warm_start'] = True
-        self.theta_params['positive'] = True
-        self.theta_params['max_iter'] = max_inner_iter
-
         self.alpha_params = {} if alpha_params is None else alpha_params
-        self.alpha_params['alpha'] = lambda_2
-        self.alpha_params['warm_start'] = True
-        self.alpha_params['max_iter'] = max_inner_iter
 
         self.descriptors = np.concatenate(
             (descriptors,
@@ -149,8 +190,24 @@ class MuMuLaDer(object):
             axis=1) if self.fit_intercept else X
 
         # Initialize theta and alpha optimizers
-        optimize_theta = Lasso(**self.theta_params)
-        optimize_alpha = Lasso(**self.alpha_params)
+        if self.optimizer == LASSO:
+            optimize_theta = Lasso(
+                alpha=self.lambda_1, warm_start=True,
+                positive=True, max_iter=self.max_inner_iter,
+                **self.theta_params)
+            optimize_alpha = Lasso(
+                alpha=self.lambda_2, warm_start=True,
+                max_iter=self.max_inner_iter, **self.alpha_params)
+        elif self.optimizer == LASSOSPAMS:
+            warnings.warn("warning: exit because implementation " +
+                          "using 'sklearn.linear_model.lasso()' " +
+                          "do not work yet")
+            optimize_theta = SpamWrapperOptimizer(
+                positive=True, lambda_=self.lambda_1,
+                params=self.theta_params, loss='square', regul='l1')
+            optimize_alpha = SpamWrapperOptimizer(
+                lambda_=self.lambda_2, params=self.alpha_params,
+                loss='square', regul='l1')
 
         # get input sizes and initizialize parameters
         # n is the total amount of instances among all tasks
@@ -170,7 +227,7 @@ class MuMuLaDer(object):
             else:
                 alpha = np.zeros((p, L), dtype=np.float64)
                 optimize_alpha.coef_ = alpha.flatten()
-            beta_0 = self.get_beta(alpha, theta)
+            beta_0 = self.get_beta_(alpha, theta)
         else:
             beta_0 = self.coef_.T
             alpha = self.alpha_
@@ -204,17 +261,17 @@ class MuMuLaDer(object):
                 .reshape((p, L))
 
             if verbose:
+                print('\tupdate beta')
+                sys.stdout.flush()
+            # update beta: \beta = \theta * (D.\alpha^T)
+            beta = self.get_beta_(alpha, theta)
+
+            if verbose:
                 print('\toptimize theta')
                 sys.stdout.flush()
             # Optimize for theta and update theta
             x_theta[:] = tasks.dot(self.descriptors.dot(alpha.T)) * X_copy
             theta[:] = optimize_theta.fit(x_theta, Y).coef_
-
-            if verbose:
-                print('\tupdate beta')
-                sys.stdout.flush()
-            # update beta: \beta = \theta * (D.\alpha^T)
-            beta = self.get_beta(alpha, theta)
 
             self.n_iter_ += 1
             if (np.linalg.norm(beta.flatten() - beta_0.flatten()) <
@@ -227,11 +284,11 @@ class MuMuLaDer(object):
                 warnings.warn("warning: exit optimization because number " +
                               "of iterations exceeded maximum " +
                               "number of allowed iterations")
-        self.coef_ = beta.T
+        self.coef_ = self.get_beta_(alpha, theta).T
         self.alpha_ = alpha
         self.theta_ = theta
 
-    def get_beta(self, alpha=None, theta=None):
+    def get_beta_(self, alpha=None, theta=None):
         """
         Computes beta based on theta, alpha and the task descriptors
         matrix.

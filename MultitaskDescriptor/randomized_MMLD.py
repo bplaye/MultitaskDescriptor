@@ -22,7 +22,7 @@ class RandomizedMuMuLaDer(object):
         """
         Reminder, default parameter values for MMLD:
         {'lambda_1': 1, 'lambda_2': 1, 'fit_intercept': False,
-        'fit_task_intercept': False, 'loss_f': MSE,
+        'fit_task_intercept': False, optimizer='spams', loss_f': MSE,
         'max_ite': 100, 'max_inner_iter': 10, 'tol': 0.01,
         'warm_start': False, 'random_init': False,
         'alpha_params': None, 'theta_params': None}
